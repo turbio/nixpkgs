@@ -1,0 +1,171 @@
+diff --git a/core/imagePipeline.cpp b/core/imagePipeline.cpp
+index 2d2036d..c8c0865 100644
+--- a/core/imagePipeline.cpp
++++ b/core/imagePipeline.cpp
+@@ -749,7 +749,7 @@ matrix<unsigned short>& ImagePipeline::processImage(ParameterManager * paramMana
+ 
+         //Lensfun processing
+         cout << "lensfun start" << endl;
+-        lfDatabase *ldb = lf_db_create();
++        lfDatabase *ldb = lf_db_new();
+         QDir dir = QDir::home();
+         QString dirstr = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+         dirstr.append("/filmulator/version_2");
+@@ -796,40 +796,30 @@ matrix<unsigned short>& ImagePipeline::processImage(ParameterManager * paramMana
+                 lens = lensList[0];
+ 
+                 //Now we set up the modifier itself with the lens and processing flags
+-#ifdef LF_GIT
+-                lfModifier * mod = new lfModifier(lens, demosaicParam.focalLength, cropFactor, width, height, LF_PF_F32);
+-#else //lensfun v0.3.95
+-                lfModifier * mod = new lfModifier(cropFactor, width, height, LF_PF_F32);
+-#endif
++                lfModifier * mod = new lfModifier(lens, cropFactor, width, height);
+ 
+-                int modflags = 0;
++                // Build flags for the corrections we want
++                int flags = 0;
+                 if (demosaicParam.lensfunCA && !isMonochrome)
+                 {
+-#ifdef LF_GIT
+-                    modflags |= mod->EnableTCACorrection();
+-#else //lensfun v0.3.95
+-                    modflags |= mod->EnableTCACorrection(lens, demosaicParam.focalLength);
+-#endif
++                    flags |= LF_MODIFY_TCA;
+                 }
+                 if (demosaicParam.lensfunVignetting)
+                 {
+-#ifdef LF_GIT
+-                    modflags |= mod->EnableVignettingCorrection(demosaicParam.fnumber, 1000.0f);
+-#else //lensfun v0.3.95
+-                    modflags |= mod->EnableVignettingCorrection(lens, demosaicParam.focalLength, demosaicParam.fnumber, 1000.0f);
+-#endif
++                    flags |= LF_MODIFY_VIGNETTING;
+                 }
+                 if (demosaicParam.lensfunDistortion)
+                 {
+-#ifdef LF_GIT
+-                    modflags |= mod->EnableDistortionCorrection();
+-#else //lensfun v0.3.95
+-                    modflags |= mod->EnableDistortionCorrection(lens, demosaicParam.focalLength);
+-#endif
+-                    modflags |= mod->EnableScaling(mod->GetAutoScale(false));
++                    flags |= LF_MODIFY_DISTORTION | LF_MODIFY_SCALE;
+                     cout << "Auto scale factor: " << mod->GetAutoScale(false) << endl;
+                 }
+ 
++                // Initialize the modifier with all corrections at once
++                float scale = (flags & LF_MODIFY_SCALE) ? mod->GetAutoScale(false) : 1.0f;
++                int modflags = mod->Initialize(lens, LF_PF_F32, demosaicParam.focalLength,
++                                               demosaicParam.fnumber, 1000.0f, scale,
++                                               LF_RECTILINEAR, flags, false);
++
+                 //Now we actually perform the required processing.
+                 //First is vignetting.
+                 if (demosaicParam.lensfunVignetting)
+diff --git a/core/imwriteJpeg.cpp b/core/imwriteJpeg.cpp
+index 81f9966..94e356b 100644
+--- a/core/imwriteJpeg.cpp
++++ b/core/imwriteJpeg.cpp
+@@ -186,7 +186,7 @@ static void remove_exif_keys(Exiv2::ExifData &exifData, const char *keys[], unsi
+             {
+                 exifData.erase(pos);
+             }
+-        } catch (Exiv2::AnyError &e) {
++        } catch (Exiv2::Error &e) {
+             //catch invalid tag
+         }
+     }
+diff --git a/database/exifFunctions.cpp b/database/exifFunctions.cpp
+index f7d5af5..c3ac0e4 100644
+--- a/database/exifFunctions.cpp
++++ b/database/exifFunctions.cpp
+@@ -123,7 +123,7 @@ int exifDefaultRotation(const std::string fullFilename)
+         int exifOrientation;
+         try
+         {
+-            exifOrientation = (int) exifData["Exif.Image.Orientation"].value().toLong();
++            exifOrientation = (int) exifData["Exif.Image.Orientation"].value().toInt64();
+         }
+         catch (...)
+         {
+@@ -295,7 +295,7 @@ int exifRating(const std::string fullFilename)
+         std::string maker = exifData["Exif.Image.Make"].toString();
+         if (maker.compare("Canon") == 0)
+         {
+-            return min(5,max(0,(int) xmpData["Xmp.xmp.Rating"].toLong()));
++            return min(5,max(0,(int) xmpData["Xmp.xmp.Rating"].toInt64()));
+         }
+         return 0;
+     }
+@@ -512,7 +512,7 @@ QString identifyLens(const std::string fullFilename)
+         return "";
+     }
+ 
+-    lfDatabase *ldb = lf_db_create();
++    lfDatabase *ldb = lf_db_new();
+     QDir dir = QDir::home();
+     QString dirstr = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+     dirstr.append("/filmulator/version_2");
+diff --git a/ui/lensSelectModel.cpp b/ui/lensSelectModel.cpp
+index e078fc5..3b826b2 100644
+--- a/ui/lensSelectModel.cpp
++++ b/ui/lensSelectModel.cpp
+@@ -26,7 +26,7 @@ LensSelectModel::LensSelectModel(QObject *parent) : QAbstractTableModel(parent)
+     dirstr.append("/filmulator/version_2");
+     std::string stdstring = dirstr.toStdString();
+ 
+-    ldb = lf_db_create();
++    ldb = lf_db_new();
+     if (!ldb)
+     {
+         cout << "Failed to create database!" << endl;
+diff --git a/ui/parameterManager.cpp b/ui/parameterManager.cpp
+index c0e18d5..4a53a06 100644
+--- a/ui/parameterManager.cpp
++++ b/ui/parameterManager.cpp
+@@ -53,7 +53,7 @@ ParameterManager::ParameterManager() : QObject(0)
+     cout << "ParamManager directory string: " << stdstring << endl;
+ 
+     cout << "ParamManager initializing lensfun db" << endl;
+-    ldb = lf_db_create();
++    ldb = lf_db_new();
+     if (!ldb)
+     {
+         cout << "Failed to create database!" << endl;
+@@ -3460,28 +3460,12 @@ void ParameterManager::updateLensfunAvailability()
+                     isMonochrome = wb.length()==0;
+                 }
+ 
+-                auto calibrationSet = lensList[0]->GetCalibrationSets();
+-
+-                int i = 0;
+-                while (calibrationSet[i])
+-                {
+-                    auto c = calibrationSet[i];
+-                    const float r = cropFactor / c->Attributes.CropFactor;
+-                    if ((r >= 0.96) || (cropFactor < 1e-6f))
+-                    {
+-                        lensfunCaAvail   = (c->HasTCA() && !isMonochrome);
+-                        lensfunVignAvail = (c->HasVignetting());
+-                        lensfunDistAvail = (c->HasDistortion());
+-                    }
+-                    i++;
+-                }
+-
+-                //The latter function is only available in lensfun master, not lensfun 3.95
+-                // So I duplicated its functionality above.
+-                //const int availableMods = lensList[0]->AvailableModifications(cropFactor);
+-                //lensfunCaAvail   = (availableMods & LF_MODIFY_TCA) && !isMonochrome;
+-                //lensfunVignAvail = availableMods & LF_MODIFY_VIGNETTING;
+-                //lensfunDistAvail = availableMods & LF_MODIFY_DISTORTION;
++                // Check if calibration data is available by checking if the arrays are non-null
++                // and have at least one entry
++                const lfLens *lens = lensList[0];
++                lensfunCaAvail   = (lens->CalibTCA && lens->CalibTCA[0] && !isMonochrome);
++                lensfunVignAvail = (lens->CalibVignetting && lens->CalibVignetting[0]);
++                lensfunDistAvail = (lens->CalibDistortion && lens->CalibDistortion[0]);
+                 emit lensfunCaAvailChanged();
+                 emit lensfunVignAvailChanged();
+                 emit lensfunDistAvailChanged();
